@@ -1,0 +1,590 @@
+/* ================================================================
+   EEG Session Comparator — app.js
+   Expects muselsl CSV: timestamps, TP9, AF7, AF8, TP10 (raw µV @ 256 Hz)
+   ================================================================ */
+'use strict';
+
+/* ── Constants ─────────────────────────────────────────────────── */
+import FFT from 'fft.js';
+
+const FS = 256; // sample rate Hz
+
+const BANDS = {
+  delta: [0.5, 4],
+  theta: [4,   8],
+  alpha: [8,  13],
+  beta:  [13, 30],
+  gamma: [30, 44],
+};
+
+const METRICS = {
+  focus:      { label: 'Focus score',          desc: 'Frontal (AF7+AF8) β/(α+θ) — sustained attention' },
+  relaxation: { label: 'Relaxation score',     desc: 'Temporal (TP9+TP10) α power — calm resting state' },
+  meditation: { label: 'Meditation depth',     desc: 'Frontal θ/α ratio — deep meditative absorption' },
+  stress:     { label: 'Stress index',         desc: 'Frontal (β+γ)/(α+θ) — cognitive tension load' },
+  asymmetry:  { label: 'Frontal α asymmetry',  desc: 'ln(AF8 α) − ln(AF7 α) — valence / approach motivation' },
+  engagement: { label: 'Engagement index',     desc: 'β/(α+θ) averaged across all 4 channels' },
+  delta:      { label: 'δ Delta power',        desc: '0.5–4 Hz mean across all channels' },
+  theta:      { label: 'θ Theta power',        desc: '4–8 Hz mean across all channels' },
+  alpha:      { label: 'α Alpha power',        desc: '8–13 Hz mean across all channels' },
+  beta:       { label: 'β Beta power',         desc: '13–30 Hz mean across all channels' },
+  gamma:      { label: 'γ Gamma power',        desc: '30–44 Hz mean across all channels' },
+};
+
+/** Session palette — each entry has hex (line), bg (pill fill), txt (pill text). */
+const PALETTE = [
+  { hex: '#7c75e0', bg: '#2a2845', txt: '#b8b3f5' },
+  { hex: '#2db891', bg: '#1a3530', txt: '#7dd6bc' },
+  { hex: '#e07050', bg: '#3a2018', txt: '#f0a080' },
+  { hex: '#5a9fe0', bg: '#1a2a40', txt: '#92c0f0' },
+  { hex: '#d96090', bg: '#3a1828', txt: '#f090b8' },
+  { hex: '#d0901a', bg: '#382808', txt: '#f0b860' },
+  { hex: '#72b830', bg: '#1c2e08', txt: '#a0d868' },
+  { hex: '#e05050', bg: '#381010', txt: '#f09090' },
+];
+
+/* ── Application state ─────────────────────────────────────────── */
+
+let sessions  = [];
+let charts    = {};
+let timeMode  = 'min'; // 'min' | 'pct'
+
+/* ── Theme ─────────────────────────────────────────────────────── */
+
+(function initTheme() {
+  // Dark is the default (set on <html> in markup). Persist user choice.
+  const saved = localStorage.getItem('eeg-theme');
+  if (saved) document.documentElement.setAttribute('data-theme', saved);
+  updateThemeButton();
+})();
+
+function updateThemeButton() {
+  const isDark  = document.documentElement.getAttribute('data-theme') === 'dark';
+  const label   = document.getElementById('themeLabel');
+  if (label) label.textContent = isDark ? 'Light mode' : 'Dark mode';
+}
+
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const html    = document.documentElement;
+  const current = html.getAttribute('data-theme');
+  const next    = current === 'dark' ? 'light' : 'dark';
+  html.setAttribute('data-theme', next);
+  localStorage.setItem('eeg-theme', next);
+  updateThemeButton();
+  // Re-render charts so axis colours update
+  renderCharts();
+});
+
+/* ── DSP helpers ───────────────────────────────────────────────── */
+
+function hann(N) {
+  return Float64Array.from({ length: N }, (_, i) => 0.5 * (1 - Math.cos(2 * Math.PI * i / (N - 1))));
+}
+
+/**
+ * Welch's averaged PSD estimate.
+ * @param {number[]} signal
+ * @param {number}   segLen   FFT window size (must be power of 2)
+ * @param {number}   overlap  Samples of overlap between windows
+ * @returns {Float64Array|null}  One-sided PSD of length segLen/2+1, or null if too short
+ */
+function welchPSD(signal, segLen = 512, overlap = 256) {
+  const step = segLen - overlap;
+  const win  = hann(segLen);
+  const f = new FFT(segLen);
+  const nSeg = Math.floor((signal.length - overlap) / step);
+  if (nSeg < 1) return null;
+
+  const psd = new Float64Array(segLen / 2 + 1);
+  let count = 0;
+
+  for (let s = 0; s < nSeg; s++) {
+    const start = s * step;
+    if (start + segLen > signal.length) break;
+    const seg = new Float64Array(segLen);
+    for (let i = 0; i < segLen; i++) seg[i] = signal[start + i] * win[i];
+    
+    // Using indutany/fft.js
+    const realOut = new Float64Array(segLen);
+    f.realTransform(realOut, seg);
+    for(let k=0;k<=segLen/2;k++) psd[k]+=realOut[k]*realOut[k];
+    count++;
+  }
+
+  const scale = count * FS * segLen;
+  for (let k = 0; k <= segLen / 2; k++) psd[k] /= scale;
+  for (let k = 1; k <  segLen / 2; k++) psd[k] *= 2; // one-sided doubling
+
+  return psd;
+}
+
+/**
+ * Integrate PSD bins within [fLow, fHigh] Hz, return mean bin power.
+ */
+function bandPower(psd, segLen, fLow, fHigh) {
+  const df = FS / segLen;
+  let sum = 0, n = 0;
+  for (let k = 0; k < psd.length; k++) {
+    const f = k * df;
+    if (f >= fLow && f <= fHigh) { sum += psd[k]; n++; }
+  }
+  return n ? sum / n : 0;
+}
+
+/**
+ * Compute all five band powers for a single-channel segment.
+ * @param {number[]} signal  Raw µV samples
+ * @returns {Object|null}  { delta, theta, alpha, beta, gamma }
+ */
+function computeBands(signal) {
+  const segLen = 512;
+  const psd    = welchPSD(signal, segLen, 256);
+  if (!psd) return null;
+  const r = {};
+  for (const [name, [lo, hi]] of Object.entries(BANDS)) r[name] = bandPower(psd, segLen, lo, hi);
+  return r;
+}
+
+/* ── Neurofeedback metric formulas ─────────────────────────────── */
+
+const avg = (...v) => v.reduce((a, b) => a + b, 0) / v.length;
+const safeLog = v   => Math.log(Math.max(v, 1e-12));
+
+/**
+ * Derive a scalar score from per-channel band powers.
+ * @param {string} metric
+ * @param {{ tp9, af7, af8, tp10 }} bp  Each value is { delta, theta, alpha, beta, gamma }
+ */
+function computeMetric(metric, bp) {
+  const { tp9, af7, af8, tp10 } = bp;
+  const eps = 1e-12;
+
+  switch (metric) {
+    case 'focus':
+      return avg(af7.beta, af8.beta) / (avg(af7.alpha, af8.alpha) + avg(af7.theta, af8.theta) + eps);
+
+    case 'relaxation':
+      return avg(tp9.alpha, tp10.alpha);
+
+    case 'meditation':
+      return avg(af7.theta, af8.theta, tp9.theta, tp10.theta) /
+             (avg(af7.alpha, af8.alpha, tp9.alpha, tp10.alpha) + eps);
+
+    case 'stress':
+      return (avg(af7.beta, af8.beta) + avg(af7.gamma, af8.gamma)) /
+             (avg(af7.alpha, af8.alpha) + avg(af7.theta, af8.theta) + eps);
+
+    case 'asymmetry':
+      return safeLog(af8.alpha) - safeLog(af7.alpha);
+
+    case 'engagement':
+      return avg(af7.beta, af8.beta, tp9.beta, tp10.beta) /
+             (avg(af7.alpha, af8.alpha, tp9.alpha, tp10.alpha) +
+              avg(af7.theta, af8.theta, tp9.theta, tp10.theta) + eps);
+
+    case 'delta': return avg(tp9.delta, af7.delta, af8.delta, tp10.delta);
+    case 'theta': return avg(tp9.theta, af7.theta, af8.theta, tp10.theta);
+    case 'alpha': return avg(tp9.alpha, af7.alpha, af8.alpha, tp10.alpha);
+    case 'beta':  return avg(tp9.beta,  af7.beta,  af8.beta,  tp10.beta);
+    case 'gamma': return avg(tp9.gamma, af7.gamma, af8.gamma, tp10.gamma);
+    default: return 0;
+  }
+}
+
+/* ── CSV parsing ───────────────────────────────────────────────── */
+
+/**
+ * Parse a muselsl EEG CSV.
+ * @returns {{ filename, raw: { tp9, af7, af8, tp10, ts } }|null}
+ */
+function parseMuselslCSV(text, filename) {
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length < 2) return null;
+
+  const hdr    = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/\s+/g, '_'));
+  const idxTs  = hdr.findIndex(h => h.includes('timestamp') || h === 'time');
+  const idxTP9 = hdr.findIndex(h => h === 'tp9');
+  const idxAF7 = hdr.findIndex(h => h === 'af7');
+  const idxAF8 = hdr.findIndex(h => h === 'af8');
+  const idxTP10= hdr.findIndex(h => h === 'tp10');
+
+  if ([idxTP9, idxAF7, idxAF8, idxTP10].some(i => i < 0)) return null;
+
+  const raw = { tp9: [], af7: [], af8: [], tp10: [], ts: [] };
+
+  for (let i = 1; i < lines.length; i++) {
+    const c   = lines[i].split(',');
+    if (c.length < 4) continue;
+    const tp9 = parseFloat(c[idxTP9]);
+    const af7 = parseFloat(c[idxAF7]);
+    const af8 = parseFloat(c[idxAF8]);
+    const tp10= parseFloat(c[idxTP10]);
+    if ([tp9, af7, af8, tp10].some(isNaN)) continue;
+    raw.tp9.push(tp9); raw.af7.push(af7); raw.af8.push(af8); raw.tp10.push(tp10);
+    raw.ts.push(idxTs >= 0 ? parseFloat(c[idxTs]) : i / FS);
+  }
+
+  if (raw.tp9.length < FS * 2) return null;
+  return { filename, raw };
+}
+
+/* ── Session processing ────────────────────────────────────────── */
+
+/**
+ * Slide a 4-second window in 1-second steps over all channels,
+ * computing band powers at each frame.
+ */
+function processSession(parsed, onProgress) {
+  const { filename, raw } = parsed;
+  const totalSamples = raw.tp9.length;
+  const winSamples   = FS * 4;
+  const stepSamples  = FS;
+  const nFrames      = Math.floor((totalSamples - winSamples) / stepSamples) + 1;
+  const channels     = ['tp9', 'af7', 'af8', 'tp10'];
+  const frames       = [];
+
+  for (let f = 0; f < nFrames; f++) {
+    const start = f * stepSamples;
+    const bp    = {};
+    for (const ch of channels) {
+      const seg = raw[ch].slice(start, start + winSamples);
+      bp[ch]    = computeBands(seg) || { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 };
+    }
+    const midIdx = start + Math.floor(winSamples / 2);
+    frames.push({ t: raw.ts[midIdx], bp });
+    if (onProgress) onProgress((f + 1) / nFrames);
+  }
+
+  // Attach relative time (seconds from session start) to each frame
+  const t0 = frames[0].t;
+  frames.forEach(fr => { fr.tSec = fr.t - t0; });
+
+  return {
+    name:        filename.replace(/\.csv$/i, ''),
+    frames,
+    durationSec: raw.ts[raw.ts.length - 1] - raw.ts[0],
+    nSamples:    totalSamples,
+  };
+}
+
+/* ── File handling ─────────────────────────────────────────────── */
+
+async function readFileText(file) {
+  return new Promise(resolve => {
+    const r  = new FileReader();
+    r.onload = e => resolve(e.target.result);
+    r.readAsText(file);
+  });
+}
+
+async function handleFiles(files) {
+  const progressWrap = document.getElementById('progressWrap');
+  const progressFill = document.getElementById('progressFill');
+  const progressMsg  = document.getElementById('progressMsg');
+
+  progressWrap.style.display = 'block';
+
+  for (const file of files) {
+    progressMsg.textContent   = `Parsing ${file.name}…`;
+    progressFill.style.width  = '5%';
+    await tick();
+
+    const text   = await readFileText(file);
+    const parsed = parseMuselslCSV(text, file.name);
+
+    if (!parsed) {
+      alert(`"${file.name}" doesn't look like a muselsl CSV.\nExpected columns: timestamps, TP9, AF7, AF8, TP10.`);
+      continue;
+    }
+
+    progressMsg.textContent = `Computing band powers for ${file.name}…`;
+    await tick();
+
+    const session = processSession(parsed, p => {
+      progressFill.style.width = Math.round(5 + p * 90) + '%';
+    });
+
+    const idx = sessions.findIndex(s => s.name === session.name);
+    if (idx >= 0) sessions[idx] = session;
+    else sessions.push(session);
+
+    progressFill.style.width = '100%';
+    await tick(50);
+  }
+
+  progressWrap.style.display = 'none';
+  render();
+}
+
+const tick = (ms = 0) => new Promise(r => setTimeout(r, ms));
+
+/* ── Render: pills + summary ───────────────────────────────────── */
+
+function render() {
+  const ctrlSection = document.getElementById('controlsSection');
+  const pillsEl     = document.getElementById('pills');
+
+  pillsEl.innerHTML = '';
+
+  if (sessions.length === 0) {
+    ctrlSection.style.display = 'none';
+    document.getElementById('chartStack').innerHTML = `
+      <div class="empty-state">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
+        </svg>
+        <p>Upload muselsl CSV files to begin comparing sessions</p>
+      </div>`;
+    return;
+  }
+
+  ctrlSection.style.display = 'block';
+
+  sessions.forEach((s, i) => {
+    const c   = PALETTE[i % PALETTE.length];
+    const pill = document.createElement('div');
+    pill.className = 'pill';
+    pill.style.cssText = `background:${c.bg};color:${c.txt};border-color:${c.hex}55`;
+    pill.innerHTML = `
+      <span class="pill-dot" style="background:${c.hex}"></span>
+      ${s.name}
+      <span class="pill-dur">${(s.durationSec / 60).toFixed(1)}min</span>
+      <button class="pill-x" data-idx="${i}" title="Remove session">×</button>`;
+    pillsEl.appendChild(pill);
+  });
+
+  renderSummary();
+  renderCharts();
+}
+
+document.getElementById('pills').addEventListener('click', e => {
+  const btn = e.target.closest('.pill-x');
+  if (!btn) return;
+  sessions.splice(+btn.dataset.idx, 1);
+  render();
+});
+
+/* ── Render: summary stat cards ────────────────────────────────── */
+
+function meanOf(arr) {
+  const v = arr.filter(x => isFinite(x));
+  return v.length ? v.reduce((a, b) => a + b, 0) / v.length : 0;
+}
+
+function renderSummary() {
+  let bestFocus = '—', bestFocusV = -Infinity;
+  let bestRelax = '—', bestRelaxV = -Infinity;
+
+  sessions.forEach(s => {
+    const f = meanOf(s.frames.map(fr => computeMetric('focus',      fr.bp)));
+    const r = meanOf(s.frames.map(fr => computeMetric('relaxation', fr.bp)));
+    if (f > bestFocusV) { bestFocusV = f; bestFocus = s.name.slice(0, 16); }
+    if (r > bestRelaxV) { bestRelaxV = r; bestRelax = s.name.slice(0, 16); }
+  });
+
+  const avgDur = (sessions.reduce((a, s) => a + s.durationSec, 0) / sessions.length / 60).toFixed(1);
+
+  const card = (lbl, val, sub) =>
+    `<div class="scard">
+       <div class="scard-lbl">${lbl}</div>
+       <div class="scard-val">${val}</div>
+       <div class="scard-sub">${sub}</div>
+     </div>`;
+
+  document.getElementById('summaryGrid').innerHTML =
+    card('Sessions',        sessions.length, 'loaded') +
+    card('Best focus',      bestFocus,        'highest frontal β/α') +
+    card('Best relaxation', bestRelax,        'highest temporal α') +
+    card('Avg duration',    avgDur + 'min',   'per session');
+}
+
+/* ── Render: charts ────────────────────────────────────────────── */
+
+function smooth(arr, w = 5) {
+  return arr.map((_, i) => {
+    const s   = Math.max(0, i - Math.floor(w / 2));
+    const e   = Math.min(arr.length - 1, i + Math.floor(w / 2));
+    const sl  = arr.slice(s, e + 1).filter(x => x !== null && isFinite(x));
+    return sl.length ? sl.reduce((a, b) => a + b, 0) / sl.length : null;
+  });
+}
+
+function resampleToPct(vals, N = 120) {
+  if (vals.length === 0) return new Array(N).fill(null);
+  return Array.from({ length: N }, (_, k) => {
+    const fi = k * (vals.length - 1) / (N - 1);
+    const lo = Math.floor(fi), hi = Math.min(lo + 1, vals.length - 1);
+    const t  = fi - lo;
+    const a  = vals[lo], b = vals[hi];
+    if (a === null || b === null) return a ?? b;
+    return a * (1 - t) + b * t;
+  });
+}
+
+/** Read CSS variable colours for Chart.js (must be called at render time). */
+function chartColors() {
+  const s = getComputedStyle(document.documentElement);
+  return {
+    grid:  s.getPropertyValue('--chart-grid').trim()       || 'rgba(255,255,255,0.06)',
+    tick:  s.getPropertyValue('--chart-tick').trim()       || '#666',
+    title: s.getPropertyValue('--chart-axis-title').trim() || '#888',
+  };
+}
+
+function buildDatasets(metric) {
+  const N = 120;
+  return sessions.map((s, i) => {
+    const c      = PALETTE[i % PALETTE.length];
+    const raw    = s.frames.map(fr => computeMetric(metric, fr.bp));
+    const smoothed = smooth(raw);
+
+    if (timeMode === 'pct') {
+      const data = resampleToPct(smoothed, N).map(v => v !== null ? +v.toFixed(5) : null);
+      return {
+        label: s.name, data,
+        borderColor: c.hex, backgroundColor: c.hex + '20',
+        borderWidth: 2, pointRadius: 0, tension: 0.35,
+        fill: false, spanGaps: true,
+      };
+    } else {
+      // Minutes: {x, y} scatter data — sessions end at their own duration
+      const data = s.frames.map((fr, k) => ({
+        x: +(fr.tSec / 60).toFixed(4),
+        y: smoothed[k] !== null ? +smoothed[k].toFixed(5) : null,
+      }));
+      return {
+        label: s.name, data,
+        borderColor: c.hex, backgroundColor: c.hex + '20',
+        borderWidth: 2, pointRadius: 0, tension: 0.35,
+        fill: false, spanGaps: true, parsing: false,
+      };
+    }
+  });
+}
+
+function renderCharts() {
+  const stack   = document.getElementById('chartStack');
+  const chosen  = [...document.querySelectorAll('#controlsSection input[type="checkbox"]:checked')]
+    .map(cb => cb.value);
+
+  // Destroy old Chart instances
+  Object.values(charts).forEach(c => c.destroy());
+  charts = {};
+  stack.innerHTML = '';
+
+  if (chosen.length === 0) {
+    stack.innerHTML = '<div class="empty-state"><p>Select at least one metric above.</p></div>';
+    return;
+  }
+
+  const N         = 120;
+  const pctLabels = Array.from({ length: N }, (_, i) => Math.round(i * 100 / (N - 1)) + '%');
+  const maxMin    = Math.ceil(Math.max(...sessions.map(s => s.durationSec / 60)) * 10) / 10;
+  const cc        = chartColors();
+  const isMin     = timeMode === 'min';
+
+  chosen.forEach(metric => {
+    const m    = METRICS[metric];
+    const cid  = 'chart_' + metric;
+
+    const legHTML = sessions.map((s, i) => {
+      const c   = PALETTE[i % PALETTE.length];
+      const avg = meanOf(s.frames.map(fr => computeMetric(metric, fr.bp)));
+      const dur = (s.durationSec / 60).toFixed(1);
+      return `<span class="leg-item">
+                <span class="leg-dot" style="background:${c.hex}"></span>
+                ${s.name} (${dur}min) — avg ${avg.toFixed(3)}
+              </span>`;
+    }).join('');
+
+    const card = document.createElement('div');
+    card.className = 'chart-card';
+    card.innerHTML = `
+      <div class="chart-title">${m.label}</div>
+      <div class="chart-desc">${m.desc}</div>
+      <div class="chart-wrap"><canvas id="${cid}"></canvas></div>
+      <div class="legend">${legHTML}</div>`;
+    stack.appendChild(card);
+
+    const datasets = buildDatasets(metric);
+
+    // Defer so the canvas has been painted
+    setTimeout(() => {
+      const ctx = document.getElementById(cid);
+      if (!ctx) return;
+
+      const xScale = isMin
+        ? {
+            type: 'linear', min: 0, max: maxMin,
+            ticks: { font: { size: 11 }, color: cc.tick, maxTicksLimit: 10,
+                     callback: v => v.toFixed(1) + 'm' },
+            grid:  { color: cc.grid },
+            title: { display: true, text: 'Time (minutes)', font: { size: 11 }, color: cc.title },
+          }
+        : {
+            ticks: { maxTicksLimit: 11, font: { size: 11 }, color: cc.tick },
+            grid:  { color: cc.grid },
+            title: { display: true, text: 'Session progress', font: { size: 11 }, color: cc.title },
+          };
+
+      charts[metric] = new Chart(ctx, {
+        type: 'line',
+        data: isMin ? { datasets } : { labels: pctLabels, datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              mode: 'index', intersect: false,
+              callbacks: { label: c => `${c.dataset.label}: ${(+c.parsed.y).toFixed(4)}` },
+            },
+          },
+          scales: {
+            x: xScale,
+            y: {
+              ticks: { font: { size: 11 }, color: cc.tick, callback: v => (+v).toFixed(3) },
+              grid:  { color: cc.grid },
+              title: { display: true, text: m.label, font: { size: 11 }, color: cc.title },
+            },
+          },
+        },
+      });
+    }, 0);
+  });
+}
+
+/* ── Time mode toggle ──────────────────────────────────────────── */
+
+document.querySelectorAll('.tgl').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tgl').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    timeMode = btn.dataset.mode;
+    if (sessions.length > 0) renderCharts();
+  });
+});
+
+/* ── Metric checkboxes ─────────────────────────────────────────── */
+
+document.querySelectorAll('#controlsSection input[type="checkbox"]').forEach(cb => {
+  cb.addEventListener('change', () => { if (sessions.length > 0) renderCharts(); });
+});
+
+/* ── Drop zone / file input ────────────────────────────────────── */
+
+const dropZone  = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+
+dropZone.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', e => handleFiles([...e.target.files]));
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('over'); });
+dropZone.addEventListener('dragleave',  () => dropZone.classList.remove('over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('over');
+  handleFiles([...e.dataTransfer.files]);
+});

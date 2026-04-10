@@ -1,0 +1,36 @@
+{
+  "name": "muse2-eeg-dashboard",
+  "description": "Load and compare pre-recorded 4-channel EEG data (Muse 2), using various neurofeedback metrics.",
+  "version": "1.1.0",
+  "homepage": "https://writer-in-fancy-pants.github.io/muse2-eeg-dashboard",
+  "author": {
+    "name": "Mehul",
+    "url": "https://writer-in-fancy-pants.github.io/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/writer-in-fancy-pants/muse2-eeg-dashboard.git"
+  },
+  "license": "Apache 2.0",
+  "bugs": {
+    "url": "https://github.com/writer-in-fancy-pants/muse2-eeg-dashboard/issues"
+  },
+  "keywords": [
+    "EEG", 
+    "vite"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "chalk": "^2.4.2",
+    "fft.js":"4.0.4",
+    "vite":"^8.0.4"
+  },
+  "dependencies": {
+    "chalk": "^2.4.2",
+    "fft.js":"4.0.4"
+  }
+}
