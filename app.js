@@ -5,7 +5,7 @@
 'use strict';
 
 /* ── Constants ─────────────────────────────────────────────────── */
-import FFT from 'fft.js';
+//import FFT from 'fft.js';
 
 const FS = 256; // sample rate Hz
 
@@ -81,6 +81,38 @@ function hann(N) {
   return Float64Array.from({ length: N }, (_, i) => 0.5 * (1 - Math.cos(2 * Math.PI * i / (N - 1))));
 }
 
+function fft(signal) {
+  const n = signal.length;
+  const re = new Float64Array(signal);
+  const im = new Float64Array(n);
+  let j = 0;
+  for (let i = 1; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      [re[i], re[j]] = [re[j], re[i]];
+      [im[i], im[j]] = [im[j], im[i]];
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len;
+    const wRe = Math.cos(ang), wIm = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let curRe = 1, curIm = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const uRe=re[i+k], uIm=im[i+k];
+        const vRe=re[i+k+len/2], vIm=im[i+k+len/2];
+        const tRe=curRe*vRe-curIm*vIm, tIm=curRe*vIm+curIm*vRe;
+        re[i+k]=uRe+tRe; im[i+k]=uIm+tIm;
+        re[i+k+len/2]=uRe-tRe; im[i+k+len/2]=uIm-tIm;
+        const nr=curRe*wRe-curIm*wIm; curIm=curRe*wIm+curIm*wRe; curRe=nr;
+      }
+    }
+  }
+  return {re, im};
+}
+
 /**
  * Welch's averaged PSD estimate.
  * @param {number[]} signal
@@ -91,7 +123,7 @@ function hann(N) {
 function welchPSD(signal, segLen = 512, overlap = 256) {
   const step = segLen - overlap;
   const win  = hann(segLen);
-  const f = new FFT(segLen);
+  //const f = new FFT(segLen);
   const nSeg = Math.floor((signal.length - overlap) / step);
   if (nSeg < 1) return null;
 
@@ -103,11 +135,13 @@ function welchPSD(signal, segLen = 512, overlap = 256) {
     if (start + segLen > signal.length) break;
     const seg = new Float64Array(segLen);
     for (let i = 0; i < segLen; i++) seg[i] = signal[start + i] * win[i];
+    const {re:fRe,im:fIm}=fft(seg);
+    for(let k=0;k<=segLen/2;k++) psd[k]+=fRe[k]*fRe[k]+fIm[k]*fIm[k];
     
     // Using indutany/fft.js
-    const realOut = new Float64Array(segLen);
-    f.realTransform(realOut, seg);
-    for(let k=0;k<=segLen/2;k++) psd[k]+=realOut[k]*realOut[k];
+    //const realOut = new Float64Array(segLen);
+    //f.realTransform(realOut, seg);
+    //for(let k=0;k<=segLen/2;k++) psd[k]+=realOut[k]*realOut[k];
     count++;
   }
 
