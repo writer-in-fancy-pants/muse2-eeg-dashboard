@@ -8,6 +8,7 @@
 //import FFT from 'fft.js';
 
 const FS = 256; // sample rate Hz
+const PSD_SEG_LEN = 512;
 
 const BANDS = {
   delta: [0.5, 4],
@@ -29,6 +30,7 @@ const METRICS = {
   alpha:      { label: 'α Alpha power',        desc: '8–13 Hz mean across all channels' },
   beta:       { label: 'β Beta power',         desc: '13–30 Hz mean across all channels' },
   gamma:      { label: 'γ Gamma power',        desc: '30–44 Hz mean across all channels' },
+  psd_slice:  { label: 'PSD slice (bin k)',    desc: 'Raw PSD power at a single frequency bin k, tracked across the session' },
 };
 
 /** Session palette — each entry has hex (line), bg (pill fill), txt (pill text). */
@@ -48,6 +50,7 @@ const PALETTE = [
 let sessions  = [];
 let charts    = {};
 let timeMode  = 'min'; // 'min' | 'pct'
+let psdBinK = 10; // default bin index (~5 Hz at 512-pt FFT, 256 Hz SR → df=0.5 Hz)
 
 /* ── Theme ─────────────────────────────────────────────────────── */
 
@@ -171,12 +174,12 @@ function bandPower(psd, segLen, fLow, fHigh) {
  * @returns {Object|null}  { delta, theta, alpha, beta, gamma }
  */
 function computeBands(signal) {
-  const segLen = 512;
+  const segLen = PSD_SEG_LEN;
   const psd    = welchPSD(signal, segLen, 256);
   if (!psd) return null;
   const r = {};
   for (const [name, [lo, hi]] of Object.entries(BANDS)) r[name] = bandPower(psd, segLen, lo, hi);
-  return r;
+  return [r, psd];
 }
 
 /* ── Neurofeedback metric formulas ─────────────────────────────── */
@@ -280,12 +283,13 @@ function processSession(parsed, onProgress) {
   for (let f = 0; f < nFrames; f++) {
     const start = f * stepSamples;
     const bp    = {};
+    const psds  = {};
     for (const ch of channels) {
       const seg = raw[ch].slice(start, start + winSamples);
-      bp[ch]    = computeBands(seg) || { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 };
+      bp[ch], psds[ch] = computeBands(seg) || [{ delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 }, new Float64Array(PSD_SEG_LEN/ 2 + 1)];
     }
     const midIdx = start + Math.floor(winSamples / 2);
-    frames.push({ t: raw.ts[midIdx], bp });
+    frames.push({ t: raw.ts[midIdx], bp, psds });
     if (onProgress) onProgress((f + 1) / nFrames);
   }
 
@@ -433,6 +437,152 @@ function renderSummary() {
     card('Avg duration',    avgDur + 'min',   'per session');
 }
 
+/* ── Frequency power spectrum ───────────────────────────────────────── */
+/** Returns the frequency (Hz) for bin k given PSD_SEG_LEN and FS */
+function binToHz(k) {
+  return +(k * FS / PSD_SEG_LEN).toFixed(2);
+}
+
+/** Which named band does a frequency fall in, or 'broadband' */
+function freqToBandName(hz) {
+  for (const [name, [lo, hi]] of Object.entries(BANDS)) {
+    if (hz >= lo && hz <= hi) return name;
+  }
+  return 'broadband';
+}
+
+/**
+ * Builds and appends the PSD slice chart card to `stack`.
+ * Called from renderCharts when 'psd_slice' is in chosen metrics.
+ */
+function buildPsdSliceCard(stack, cc, isMin, maxMin, pctLabels) {
+  const N   = 120;
+  const cid = 'chart_psd_slice';
+  const maxK = PSD_SEG_LEN / 2; // Nyquist bin
+
+  const card = document.createElement('div');
+  card.className = 'chart-card';
+  card.id = 'psdSliceCard';
+
+  card.innerHTML = `
+    <div class="chart-title">PSD slice (bin k)</div>
+    <div class="chart-desc">Raw PSD power at a single frequency bin, compared across sessions. Drag the slider to scan frequency.</div>
+    <div class="psd-controls">
+      <input type="range" class="psd-slider" id="psdSlider"
+             min="1" max="${maxK}" step="1" value="${psdBinK}" />
+      <span class="psd-freq-label">k = <strong id="psdKVal">${psdBinK}</strong> → <strong id="psdHzVal">${binToHz(psdBinK)} Hz</strong></span>
+      <span class="psd-band-badge" id="psdBandBadge">${freqToBandName(binToHz(psdBinK))}</span>
+    </div>
+    <div class="chart-wrap"><canvas id="${cid}"></canvas></div>
+    <div class="legend" id="psdSliceLegend"></div>`;
+
+  stack.appendChild(card);
+
+  function getDatasets(k) {
+    return sessions.map((s, i) => {
+      const c = PALETTE[i % PALETTE.length];
+
+      if (isMin) {
+        const data = s.frames.map(fr => ({
+          x: +(fr.tSec / 60).toFixed(4),
+          y: +avg(...Object.values(fr.psds).map(psd => psd[k] ?? 0)).toFixed(8),
+        }));
+        return {
+          label: s.name, data,
+          borderColor: c.hex, backgroundColor: c.hex + '20',
+          borderWidth: 2, pointRadius: 0, tension: 0.35,
+          fill: false, spanGaps: true, parsing: false,
+        };
+      } else {
+        const raw      = s.frames.map(fr => avg(...Object.values(fr.psds).map(psd => psd[k] ?? 0)));
+        const smoothed = smooth(raw);
+        const data     = resampleToPct(smoothed, N).map(v => v !== null ? +v.toFixed(8) : null);
+        return {
+          label: s.name, data,
+          borderColor: c.hex, backgroundColor: c.hex + '20',
+          borderWidth: 2, pointRadius: 0, tension: 0.35,
+          fill: false, spanGaps: true,
+        };
+      }
+    });
+  }
+
+  function updateLegend(k) {
+    const legendEl = document.getElementById('psdSliceLegend');
+    if (!legendEl) return;
+    legendEl.innerHTML = sessions.map((s, i) => {
+      const c   = PALETTE[i % PALETTE.length];
+      const avg_ = meanOf(s.frames.map(fr => avg(...Object.values(fr.psds).map(psd => psd[k] ?? 0))));
+      return `<span class="leg-item">
+                <span class="leg-dot" style="background:${c.hex}"></span>
+                ${s.name} — avg ${avg_.toExponential(2)}
+              </span>`;
+    }).join('');
+  }
+
+  // Initial render
+  setTimeout(() => {
+    const ctx = document.getElementById(cid);
+    if (!ctx) return;
+
+    const xScale = isMin
+      ? {
+          type: 'linear', min: 0, max: maxMin,
+          ticks: { font: { size: 11 }, color: cc.tick, maxTicksLimit: 10,
+                   callback: v => v.toFixed(1) + 'm' },
+          grid:  { color: cc.grid },
+          title: { display: true, text: 'Time (minutes)', font: { size: 11 }, color: cc.title },
+        }
+      : {
+          ticks: { maxTicksLimit: 11, font: { size: 11 }, color: cc.tick },
+          grid:  { color: cc.grid },
+          title: { display: true, text: 'Session progress', font: { size: 11 }, color: cc.title },
+        };
+
+    charts['psd_slice'] = new Chart(ctx, {
+      type: 'line',
+      data: isMin ? { datasets: getDatasets(psdBinK) } : { labels: pctLabels, datasets: getDatasets(psdBinK) },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            mode: 'index', intersect: false,
+            callbacks: { label: c => `${c.dataset.label}: ${(+c.parsed.y).toExponential(3)}` },
+          },
+        },
+        scales: {
+          x: xScale,
+          y: {
+            ticks: { font: { size: 11 }, color: cc.tick, callback: v => (+v).toExponential(1) },
+            grid:  { color: cc.grid },
+            title: { display: true, text: 'PSD (µV²/Hz)', font: { size: 11 }, color: cc.title },
+          },
+        },
+      },
+    });
+
+    updateLegend(psdBinK);
+
+    // Slider interaction — update chart data in-place without full re-render
+    document.getElementById('psdSlider').addEventListener('input', e => {
+      const k   = +e.target.value;
+      psdBinK   = k;
+      const hz  = binToHz(k);
+      document.getElementById('psdKVal').textContent   = k;
+      document.getElementById('psdHzVal').textContent  = hz + ' Hz';
+      document.getElementById('psdBandBadge').textContent = freqToBandName(hz);
+
+      const ch = charts['psd_slice'];
+      if (!ch) return;
+      const newDs = getDatasets(k);
+      ch.data.datasets.forEach((ds, i) => { ds.data = newDs[i].data; });
+      ch.update('none'); // skip animation for smooth scrubbing
+      updateLegend(k);
+    });
+  }, 0);
+}
+
 /* ── Render: charts ────────────────────────────────────────────── */
 
 function smooth(arr, w = 5) {
@@ -531,6 +681,11 @@ function renderCharts() {
                 ${s.name} (${dur}min) — avg ${avg.toFixed(3)}
               </span>`;
     }).join('');
+
+    if (metric === 'psd_slice') {
+      buildPsdSliceCard(stack, cc, isMin, maxMin, pctLabels);
+      return;
+    }
 
     const card = document.createElement('div');
     card.className = 'chart-card';
