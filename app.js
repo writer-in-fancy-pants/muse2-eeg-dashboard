@@ -179,7 +179,7 @@ function computeBands(signal) {
   if (!psd) return null;
   const r = {};
   for (const [name, [lo, hi]] of Object.entries(BANDS)) r[name] = bandPower(psd, segLen, lo, hi);
-  return [r, psd];
+  return r;
 }
 
 /* ── Neurofeedback metric formulas ─────────────────────────────── */
@@ -286,7 +286,13 @@ function processSession(parsed, onProgress) {
     const psds  = {};
     for (const ch of channels) {
       const seg = raw[ch].slice(start, start + winSamples);
-      bp[ch], psds[ch] = computeBands(seg) || [{ delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 }, new Float64Array(PSD_SEG_LEN/ 2 + 1)];
+      const psd = welchPSD(seg, PSD_SEG_LEN, 256);
+      psds[ch]   = psd || new Float64Array(PSD_SEG_LEN / 2 + 1);
+      bp[ch]     = psd ? (() => {
+        const r = {};
+        for (const [name, [lo, hi]] of Object.entries(BANDS)) r[name] = bandPower(psd, PSD_SEG_LEN, lo, hi);
+        return r;
+      })() : { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 };
     }
     const midIdx = start + Math.floor(winSamples / 2);
     frames.push({ t: raw.ts[midIdx], bp, psds });
@@ -672,6 +678,10 @@ function renderCharts() {
     const m    = METRICS[metric];
     const cid  = 'chart_' + metric;
 
+    if (metric === 'psd_slice') {
+      buildPsdSliceCard(stack, cc, isMin, maxMin, pctLabels);
+      return;
+    }
     const legHTML = sessions.map((s, i) => {
       const c   = PALETTE[i % PALETTE.length];
       const avg = meanOf(s.frames.map(fr => computeMetric(metric, fr.bp)));
@@ -681,11 +691,6 @@ function renderCharts() {
                 ${s.name} (${dur}min) — avg ${avg.toFixed(3)}
               </span>`;
     }).join('');
-
-    if (metric === 'psd_slice') {
-      buildPsdSliceCard(stack, cc, isMin, maxMin, pctLabels);
-      return;
-    }
 
     const card = document.createElement('div');
     card.className = 'chart-card';
