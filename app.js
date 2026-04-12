@@ -18,6 +18,35 @@ const BANDS = {
   gamma: [30, 44],
 };
 
+/* Precomputed - like Muse S Athena */
+/**
+ * Candidate column name patterns for pre-computed band CSVs (Muse S Athena etc.).
+ * Keys are internal band names; values are ordered lists of substrings to match
+ * against lowercased, underscore-normalised header tokens.
+ * First match wins.
+ */
+const PRECOMPUTED_COL_PATTERNS = {
+  delta: ['delta_absolute', 'delta_abs', 'delta'],
+  theta: ['theta_absolute', 'theta_abs', 'theta'],
+  alpha: ['alpha_absolute', 'alpha_abs', 'alpha'],
+  beta:  ['beta_absolute',  'beta_abs',  'beta'],
+  gamma: ['gamma_absolute', 'gamma_abs', 'gamma'],
+};
+
+/**
+ * Channel groups for pre-computed files.
+ * Many Muse exports give per-electrode columns; we average into the four
+ * virtual channels expected by computeMetric().
+ * Each entry maps an internal channel name to column substrings to try.
+ */
+const PRECOMPUTED_CHANNEL_PATTERNS = {
+  tp9:  { delta: ['delta_tp9'],  theta: ['theta_tp9'],  alpha: ['alpha_tp9'],  beta: ['beta_tp9'],  gamma: ['gamma_tp9']  },
+  af7:  { delta: ['delta_af7'],  theta: ['theta_af7'],  alpha: ['alpha_af7'],  beta: ['beta_af7'],  gamma: ['gamma_af7']  },
+  af8:  { delta: ['delta_af8'],  theta: ['theta_af8'],  alpha: ['alpha_af8'],  beta: ['beta_af8'],  gamma: ['gamma_af8']  },
+  tp10: { delta: ['delta_tp10'], theta: ['theta_tp10'], alpha: ['alpha_tp10'], beta: ['beta_tp10'], gamma: ['gamma_tp10'] },
+};
+/*----*/
+
 const METRICS = {
   focus:      { label: 'Focus score',          desc: 'Frontal (AF7+AF8) β/(α+θ) — sustained attention' },
   relaxation: { label: 'Relaxation score',     desc: 'Temporal (TP9+TP10) α power — calm resting state' },
@@ -240,10 +269,11 @@ function parseMuselslCSV(text, filename) {
 
   const hdr    = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/\s+/g, '_'));
   const idxTs  = hdr.findIndex(h => h.includes('timestamp') || h === 'time');
-  const idxTP9 = hdr.findIndex(h => h === 'tp9');
-  const idxAF7 = hdr.findIndex(h => h === 'af7');
-  const idxAF8 = hdr.findIndex(h => h === 'af8');
-  const idxTP10= hdr.findIndex(h => h === 'tp10');
+  const idxTP9 = hdr.findIndex(h => h === 'tp9' || h === 'eeg_1');
+  const idxAF7 = hdr.findIndex(h => h === 'af7' || h === 'eeg_2');
+  const idxAF8 = hdr.findIndex(h => h === 'af8' || h === 'eeg_3');
+  const idxTP10= hdr.findIndex(h => h === 'tp10'|| h === 'eeg_4');
+
 
   if ([idxTP9, idxAF7, idxAF8, idxTP10].some(i => i < 0)) return null;
 
@@ -258,11 +288,167 @@ function parseMuselslCSV(text, filename) {
     const tp10= parseFloat(c[idxTP10]);
     if ([tp9, af7, af8, tp10].some(isNaN)) continue;
     raw.tp9.push(tp9); raw.af7.push(af7); raw.af8.push(af8); raw.tp10.push(tp10);
+    console.log()
     raw.ts.push(idxTs >= 0 ? parseFloat(c[idxTs]) : i / FS);
   }
 
   if (raw.tp9.length < FS * 2) return null;
   return { filename, raw };
+}
+
+/**
+ * Parse a CSV that already contains band power columns (e.g. Muse S Athena exports).
+ * Supports two layouts:
+ *   A) Per-electrode columns: Delta_TP9, Alpha_AF7 … (Mind Monitor style)
+ *   B) Single averaged columns: Delta_Absolute, Alpha_Absolute … (Muse Direct style)
+ *
+ * Returns null if the file doesn't look like a pre-computed band CSV.
+ * Sets session.precomputed = true and session.hasPSD = false on the result.
+ *
+ * @returns {{ filename, rows: Array<{tSec, bp}>, durationSec }|null}
+ */
+function parsePrecomputedCSV(text, filename) {
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length < 2) return null;
+
+  const rawHdr = lines[0].split(',').map(h => h.trim());
+  const hdr    = rawHdr.map(h => h.toLowerCase().replace(/[\s\-]+/g, '_'));
+
+  // Helper: find first header index whose token includes any of the given substrings
+  const findCol = (candidates) =>
+    hdr.findIndex(h => candidates.some(c => h.includes(c)));
+
+  const idxTs = hdr.findIndex(h => h.includes('timestamp') || h === 'time');
+
+  // ── Layout detection ────────────────────────────────────────────────────────
+  // Try per-electrode layout first (requires at least one electrode-specific col)
+  const chPatterns = PRECOMPUTED_CHANNEL_PATTERNS;
+  const perElectrodeIdx = {};
+  let perElectrodeValid = true;
+
+  for (const [ch, bands] of Object.entries(chPatterns)) {
+    perElectrodeIdx[ch] = {};
+    for (const [band, candidates] of Object.entries(bands)) {
+      const idx = findCol(candidates);
+      perElectrodeIdx[ch][band] = idx; // may be -1
+    }
+    // Channel is usable if at least one band column found
+    const found = Object.values(perElectrodeIdx[ch]).filter(i => i >= 0).length;
+    if (found === 0) perElectrodeValid = false;
+  }
+
+  // Try averaged layout
+  const avgIdx = {};
+  let avgValid = true;
+  for (const [band, candidates] of Object.entries(PRECOMPUTED_COL_PATTERNS)) {
+    const idx = findCol(candidates);
+    avgIdx[band] = idx;
+    if (idx < 0) avgValid = false;
+  }
+
+  if (!perElectrodeValid && !avgValid) return null;
+
+  const usePerElectrode = perElectrodeValid;
+
+  // ── Row parsing ─────────────────────────────────────────────────────────────
+  const rows = [];
+  let t0 = null;
+
+  for (let i = 1; i < lines.length; i++) {
+    const cells = lines[i].split(',');
+    if (cells.length < 2) continue;
+
+    const ts = idxTs >= 0 ? parseFloat(cells[idxTs]) : i;
+    if (isNaN(ts)) continue;
+    if (t0 === null) t0 = ts;
+
+    let bp;
+
+    if (usePerElectrode) {
+      // Build bp with best-effort per-channel values; fall back to cross-channel
+      // average for any missing electrode column.
+      const chBands = {};
+      for (const [ch, bands] of Object.entries(perElectrodeIdx)) {
+        chBands[ch] = {};
+        for (const [band, idx] of Object.entries(bands)) {
+          chBands[ch][band] = idx >= 0 ? parseFloat(cells[idx]) : NaN;
+        }
+      }
+
+      // For each band, compute a fallback average across channels that have a value
+      const bandFallback = {};
+      for (const band of Object.keys(BANDS)) {
+        const vals = Object.values(chBands).map(b => b[band]).filter(v => !isNaN(v));
+        bandFallback[band] = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+      }
+
+      // Fill missing per-channel values from fallback
+      bp = {};
+      for (const ch of ['tp9', 'af7', 'af8', 'tp10']) {
+        bp[ch] = {};
+        for (const band of Object.keys(BANDS)) {
+          const v = chBands[ch][band];
+          bp[ch][band] = isNaN(v) ? bandFallback[band] : v;
+        }
+      }
+    } else {
+      // Averaged layout — same value broadcast to all four virtual channels
+      const shared = {};
+      for (const [band, idx] of Object.entries(avgIdx)) {
+        shared[band] = parseFloat(cells[idx]);
+        if (isNaN(shared[band])) shared[band] = 0;
+      }
+      bp = { tp9: shared, af7: shared, af8: shared, tp10: shared };
+    }
+
+    // Skip rows that look like all-zero artefacts
+    const anyNonZero = Object.values(bp.af7).some(v => v !== 0);
+    if (!anyNonZero) continue;
+
+    rows.push({ tSec: ts - t0, bp, t: ts });
+  }
+
+  if (rows.length < 2) return null;
+
+  const durationSec = rows[rows.length - 1].t - rows[0].t;
+
+  return {
+    filename,
+    rows,
+    durationSec,
+    precomputed: true,
+    hasPSD: false,
+    nSamples: rows.length,
+    layout: usePerElectrode ? 'per-electrode' : 'averaged',
+  };
+}
+
+/**
+ * Convert parsed pre-computed rows into the same session shape that
+ * processSession() produces, so all downstream rendering is identical.
+ * Frames are the rows themselves — no windowing needed.
+ */
+function processPrecomputedSession(parsed) {
+  const { filename, rows, durationSec, nSamples, layout } = parsed;
+
+  // Frames mirror the muselsl shape: { t, tSec, bp, psds }
+  // psds is null for pre-computed sessions — the PSD slice chart skips them.
+  const frames = rows.map(r => ({
+    t:    r.t,
+    tSec: r.tSec,
+    bp:   r.bp,
+    psds: null,
+  }));
+
+  return {
+    name:        filename.replace(/\.csv$/i, ''),
+    frames,
+    durationSec,
+    nSamples,
+    precomputed: true,
+    hasPSD:      false,
+    layout,       // 'per-electrode' | 'averaged' — shown in pill tooltip
+  };
 }
 
 /* ── Session processing ────────────────────────────────────────── */
@@ -300,6 +486,7 @@ function processSession(parsed, onProgress) {
   }
 
   // Attach relative time (seconds from session start) to each frame
+  console.log(totalSamples, frames.length);
   const t0 = frames[0].t;
   frames.forEach(fr => { fr.tSec = fr.t - t0; });
 
@@ -348,6 +535,21 @@ async function handleFiles(files) {
       progressFill.style.width = Math.round(5 + p * 90) + '%';
     });
 
+    // Fall back to pre-computed band CSV (Muse S Athena, Mind Monitor, etc.)
+    if (!session) {
+      const parsedPre = parsePrecomputedCSV(text, file.name);
+      if (parsedPre) {
+        progressMsg.textContent = `Loading pre-computed bands for ${file.name}…`;
+        await tick();
+        session = processPrecomputedSession(parsedPre);
+      }
+    }
+
+    if (!session) {
+      alert(`"${file.name}" could not be parsed.\n\nExpected either:\n• muselsl raw CSV (columns: timestamps, TP9, AF7, AF8, TP10)\n• Pre-computed band CSV (columns: Delta/Theta/Alpha/Beta/Gamma, optionally per electrode)`);
+      continue;
+    }
+
     const idx = sessions.findIndex(s => s.name === session.name);
     if (idx >= 0) sessions[idx] = session;
     else sessions.push(session);
@@ -394,6 +596,7 @@ function render() {
       <span class="pill-dot" style="background:${c.hex}"></span>
       ${s.name}
       <span class="pill-dur">${(s.durationSec / 60).toFixed(1)}min</span>
+      ${s.precomputed ? `<span class="pill-dur" title="Layout: ${s.layout}">· pre-computed</span>` : ''}
       <button class="pill-x" data-idx="${i}" title="Remove session">×</button>`;
     pillsEl.appendChild(pill);
   });
@@ -485,8 +688,12 @@ function buildPsdSliceCard(stack, cc, isMin, maxMin, pctLabels) {
   stack.appendChild(card);
 
   function getDatasets(k) {
-    return sessions.map((s, i) => {
-      const c = PALETTE[i % PALETTE.length];
+    return sessions
+      .filter(s => s.hasPSD !== false)   // skip pre-computed sessions
+      .map((s, i) => {
+        // find original palette index by name so colours stay consistent
+        const origIdx = sessions.findIndex(sess => sess.name === s.name);
+        const c = PALETTE[origIdx % PALETTE.length];
 
       if (isMin) {
         const data = s.frames.map(fr => ({
@@ -746,7 +953,16 @@ function renderCharts() {
           },
         },
       });
+      // Note sessions excluded from PSD slice chart
+      const excluded = sessions.filter(s => s.hasPSD === false);
+      if (excluded.length) {
+        const note = document.createElement('p');
+        note.className = 'psd-unavail-note';
+        note.innerHTML = `<span>ⓘ</span> ${excluded.map(s => s.name).join(', ')} excluded — pre-computed files have no raw PSD.`;
+        document.getElementById('psdSliceCard').appendChild(note);
+      }
     }, 0);
+
   });
 }
 
