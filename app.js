@@ -358,7 +358,8 @@ function parsePrecomputedCSV(text, filename) {
     const cells = lines[i].split(',');
     if (cells.length < 2) continue;
 
-    const ts = idxTs >= 0 ? parseFloat(cells[idxTs]) : i;
+    //const ts = idxTs >= 0 ? parseFloat(cells[idxTs]) : i;
+    const ts = idxTs >= 0 ? (new Date(cells[idxTs]).getTime()/1000.0 ): i;
     if (isNaN(ts)) continue;
     if (t0 === null) t0 = ts;
 
@@ -521,19 +522,19 @@ async function handleFiles(files) {
     await tick();
 
     const text   = await readFileText(file);
-    const parsed = parseMuselslCSV(text, file.name);
 
-    if (!parsed) {
-      alert(`"${file.name}" doesn't look like a muselsl CSV.\nExpected columns: timestamps, TP9, AF7, AF8, TP10.`);
-      continue;
+    // ── Detect format and parse ──────────────────────────────────────────────
+    let session = null;
+
+    // Try muselsl raw format first (has TP9/AF7/AF8/TP10 raw µV columns)
+    const parsedRaw = parseMuselslCSV(text, file.name);
+    if (parsedRaw) {
+      progressMsg.textContent = `Computing band powers for ${file.name}…`;
+      await tick();
+      session = processSession(parsedRaw, p => {
+        progressFill.style.width = Math.round(5 + p * 90) + '%';
+      });
     }
-
-    progressMsg.textContent = `Computing band powers for ${file.name}…`;
-    await tick();
-
-    const session = processSession(parsed, p => {
-      progressFill.style.width = Math.round(5 + p * 90) + '%';
-    });
 
     // Fall back to pre-computed band CSV (Muse S Athena, Mind Monitor, etc.)
     if (!session) {
@@ -959,7 +960,7 @@ function renderCharts() {
         const note = document.createElement('p');
         note.className = 'psd-unavail-note';
         note.innerHTML = `<span>ⓘ</span> ${excluded.map(s => s.name).join(', ')} excluded — pre-computed files have no raw PSD.`;
-        document.getElementById('psdSliceCard').appendChild(note);
+        //document.getElementById('psdSliceCard').appendChild(note);
       }
     }, 0);
 

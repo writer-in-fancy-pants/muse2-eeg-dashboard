@@ -18,3 +18,13 @@ By default, the output will be saved in `./converted` which can be changed using
 ```
 python convert_to_muselsl.py -i <directory_of_csv_files/path_to_csv_file> -o <output_directory>
 ```
+
+
+## Supported devices
+* Muse 2 recordings - muselsl / muselab / mind monitor
+* Muse S Athena - muselsl / muselab mind monitor 
+
+## Notes
+* Make sure to record raw data at 256 HZ
+* Now supported precomputed csv - channelwise frequency bands ie alpha_tp9, delta_af7, etc.
+  * requires all channels (tp9, af7, af8, tp10), and all bands (delta, theta, alpha, beta, gamma)
